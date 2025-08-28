@@ -1,10 +1,12 @@
-# app.py — Streamlit: Åbne besvarelser → entydige kategorier
+# app.py — Streamlit: Åbne besvarelser → ENTYDIGE kategorier
 # - Password via Secrets: APP_PASSWORD="din-kode"
 # - Valgfri LLM (OpenAI) til global, entydig navngivning: OPENAI_API_KEY="sk-..."
-# - Flow: Auto-emner → LLM rydder op (1–3 ord, uden overlap) → vælg mål-antal → sammenlæg → multi-label tildeling → download
+# - Flow: Auto-emner → LLM rydder op (1–3 ord, uden overlap) → vælg mål-antal (5–20)
+#         → sammenlæg (bevar "Ved ikke" og "Andet") → multi-label tildeling → download
 
 import os
 import io
+import re
 import math
 from datetime import datetime
 from collections import Counter
@@ -19,18 +21,23 @@ from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import normalize
 from sklearn.metrics.pairwise import cosine_distances
 
-# -----------------------------
+# -------------------------------------------------
+# Streamlit page config (skal kaldes tidligt)
+# -------------------------------------------------
+st.set_page_config(page_title="Åbne svar → Entydige kategorier (secure)", layout="wide")
+
+# -------------------------------------------------
 # Basale indstillinger (du kan tweake)
-# -----------------------------
+# -------------------------------------------------
 MIN_DF = 5
 MAX_FEATURES = 40000
 NGRAM_RANGE = (1, 2)
-K_RANGE = range(6, 16)  # lidt færre rå-klynger for mere robuste emner
+K_RANGE = range(6, 16)       # lidt færre rå-klynger for mere robuste emner
 TOP_TERMS_PER_CAT = 8
 TOP_QUOTES_PER_CAT = 3
 PRIMARY_THRESHOLD = 0.18
-SECOND_THRESHOLD = 0.14
-THIRD_THRESHOLD  = 0.12
+SECOND_THRESHOLD  = 0.14
+THIRD_THRESHOLD   = 0.12
 
 # Stopord (dansk + engelsk)
 DANISH_SW = {
@@ -42,9 +49,9 @@ DANISH_SW = {
 }
 STOP_WORDS = set(ENGLISH_STOP_WORDS) | DANISH_SW
 
-# -----------------------------
+# -------------------------------------------------
 # Sikkerhed og session-log
-# -----------------------------
+# -------------------------------------------------
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", None)
 
 def check_auth():
@@ -85,17 +92,15 @@ def download_audit_widget():
 if not check_auth():
     st.stop()
 
-# -----------------------------
+# -------------------------------------------------
 # UI
-# -----------------------------
-st.set_page_config(page_title="Åbne svar → Entydige kategorier (secure)", layout="wide")
+# -------------------------------------------------
 st.title("Åbne besvarelser → Entydige kategorier")
-st.caption("Auto-emner → LLM rydder op (1–3 ord, uden overlap) → vælg mål-antal → sammenlæg → multi-label tildeling → download.")
-
+st.caption("Auto-emner → LLM rydder op (1–3 ord, uden ord-overlap) → vælg mål-antal (5–20) → sammenlæg (bevar 'Ved ikke' og 'Andet') → multi-label → download.")
 st.markdown(
     "Upload et Excel-ark med en kolonne med åbne svar (fx **Svar**). "
-    "App'en finder rå-emner, LLM kan gøre labels entydige (1–3 ord, uden ord-overlap), "
-    "og du kan slå dem sammen til et ønsket antal kategorier."
+    "App'en finder rå-emner; LLM kan gøre labels entydige (1–3 ord, uden ord-overlap); "
+    "du kan slå dem sammen til et ønsket antal kategorier."
 )
 
 uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
@@ -105,9 +110,9 @@ llm_temperature = st.slider("LLM temperatur", 0.0, 1.0, 0.2, 0.05, disabled=not 
 log_event("llm_toggle", enabled=bool(use_llm), model=llm_model if use_llm else None,
           temperature=float(llm_temperature) if use_llm else None)
 
-# -----------------------------
+# -------------------------------------------------
 # Hjælpefunktioner
-# -----------------------------
+# -------------------------------------------------
 def read_excel_first_text_column(file) -> pd.DataFrame:
     df = pd.read_excel(file)
     if df.shape[1] == 0:
@@ -130,9 +135,27 @@ def auto_label_from_terms(terms):
             return t2.capitalize()
     return "Andet"
 
+# --- Label-normalisering og deduplikering (entydige labels) ---
+def _strip_danish_suffix(word: str) -> str:
+    w = word.lower().strip()
+    w = re.sub(r"[^a-zA-ZæøåÆØÅ]+$", "", w)
+    for suf in ["erne","enes","ende","tene","eren","er","en","et","e"]:
+        if w.endswith(suf) and len(w) > len(suf) + 1:
+            w = w[:-len(suf)]
+            break
+    return w
+
+def normalize_label(label: str) -> str:
+    s = re.sub(r"[^A-Za-zÆØÅæøå\s]", " ", label).strip().lower()
+    words = [w for w in re.split(r"\s+", s) if w]
+    words = [_strip_danish_suffix(w) for w in words]
+    words = [w for w in words if w][:3]  # maks 3 ord
+    if not words:
+        return "Andet"
+    return " ".join(words).capitalize()
+
 # --- LLM navngivning globalt (1–3 ord, og ingen ord-overlap på tværs) ---
 def _label_tokens(s: str):
-    import re
     toks = re.findall(r"[A-Za-zÆØÅæøå]+", s.lower())
     return [t for t in toks if len(t) >= 2]
 
@@ -181,7 +204,6 @@ def llm_name_categories_global(terms_list, counts_list, model="gpt-4o-mini", tem
             labels += ["Andet"] * (len(terms_list) - len(labels))
         if len(labels) > len(terms_list):
             labels = labels[:len(terms_list)]
-        # cleanup for overlaps
         overlaps = _has_word_overlap(labels)
         if overlaps:
             fix_spec = (
@@ -206,12 +228,24 @@ def llm_name_categories_global(terms_list, counts_list, model="gpt-4o-mini", tem
 
 # --- Sammenlægning til target_n via agglomerativ klynge på center-vektorer ---
 def merge_category_centers(centers, id2label, counts, target_n):
+    """
+    centers: np.array [K, F] rå-klyngecentre
+    id2label: {cid: label}
+    counts: antal svar pr. rå-klynge
+    target_n: ønsket antal grupper for de 'flettelige' kategorier (uden Andet/Ved ikke)
+    """
     K = centers.shape[0]
     if target_n >= K:
         return {i:i for i in range(K)}, [id2label[i] for i in range(K)]
+
     D = cosine_distances(centers)
-    agg = AgglomerativeClustering(n_clusters=target_n, affinity="precomputed", linkage="average")
+    agg = AgglomerativeClustering(
+        n_clusters=target_n,
+        metric="precomputed",   # vigitgt i ny sklearn
+        linkage="average",
+    )
     groups = agg.fit_predict(D)
+
     group_labels = []
     for g in range(target_n):
         members = [i for i in range(K) if groups[i] == g]
@@ -220,12 +254,13 @@ def merge_category_centers(centers, id2label, counts, target_n):
             continue
         best = max(members, key=lambda i: counts[i])
         group_labels.append(id2label[best])
+
     mapping = {i: groups[i] for i in range(K)}
     return mapping, group_labels
 
-# -----------------------------
+# -------------------------------------------------
 # Hovedlogik
-# -----------------------------
+# -------------------------------------------------
 if uploaded:
     log_event("file_upload", filename=getattr(uploaded, "name", "unknown"))
 
@@ -258,7 +293,7 @@ if uploaded:
                 best_k, best_score, best_km, best_labels = k, score, km, labs
 
         km = best_km
-        labels = best_labels  # kmeans labels for counts
+        labels = best_labels
         centers = km.cluster_centers_
         centers_norm = normalize(centers, norm="l2", axis=1)
         X_norm = normalize(X, norm="l2", axis=1)
@@ -278,19 +313,29 @@ if uploaded:
             temperature=float(llm_temperature)
         ) if use_llm else None
 
+        # Entydige labels med normalisering + deduplikering
         categories_info = {}
         id2label = {}
+        seen_norm = set()
         for cid in range(best_k):
             if labels_llm and cid < len(labels_llm) and labels_llm[cid]:
-                label = labels_llm[cid]
+                raw_label = labels_llm[cid]
             else:
-                label = auto_label_from_terms(terms_per_cid[cid])
+                raw_label = auto_label_from_terms(terms_per_cid[cid])
+            label = normalize_label(raw_label)
+
             base = label
             suffix = 2
-            while label in categories_info:
-                label = f"{base} ({suffix})"
+            while label.lower() in seen_norm:
+                label = f"{base} {suffix}"
                 suffix += 1
-            categories_info[label] = {"id": cid, "top_terms": terms_per_cid[cid], "count": counts_per_cid[cid]}
+
+            seen_norm.add(label.lower())
+            categories_info[label] = {
+                "id": cid,
+                "top_terms": terms_per_cid[cid],
+                "count": counts_per_cid[cid]
+            }
             id2label[cid] = label
 
         # --- Vis rå labels og top-termer
@@ -302,18 +347,37 @@ if uploaded:
         })
         st.dataframe(preview, use_container_width=True)
 
-        # --- Vælg mål-antal og slå sammen
-        target_n = st.slider("Ønsket antal kategorier (efter sammenlægning)", min_value=3, max_value=max(3, best_k), value=min(10, best_k))
+        # --- Vælg samlet mål-antal inkl. 'Ved ikke' og 'Andet'
+        target_total = st.slider(
+            "Ønsket samlet antal kategorier (inkl. 'Ved ikke' og 'Andet')",
+            min_value=5, max_value=20, value=min(10, max(5, best_k))
+        )
 
         if st.button("Slå kategorier sammen til valgt antal"):
-            mapping, merged_labels = merge_category_centers(centers, {i: id2label[i] for i in range(best_k)}, counts_per_cid, target_n)
-            st.success(f"Slog {best_k} rå-kategorier sammen til {target_n}.")
-            st.write("**Nye kategorier:**")
-            st.write(", ".join(merged_labels))
+            # Vi fletter rå-kategorier ned til core = target_total - 2 (de 2 reserverede tilføjes bagefter)
+            target_core = max(1, target_total - 2)
 
-            # Gruppér centre (gennemsnit) og tildel multi-labels igen
+            mapping, core_labels = merge_category_centers(
+                centers,
+                {i: id2label[i] for i in range(best_k)},
+                counts_per_cid,
+                target_core
+            )
+
+            # Tilføj de to faste labels i slutlisten uden dubletter
+            final_labels = list(core_labels)
+            if not any(lbl.lower() == "ved ikke" for lbl in final_labels):
+                final_labels.append("Ved ikke")
+            if not any(lbl.lower() == "andet" for lbl in final_labels):
+                final_labels.append("Andet")
+
+            st.success(f"Slog {best_k} rå-kategorier sammen til {len(core_labels)} + 2 (Ved ikke, Andet) = {len(final_labels)} kategorier.")
+            st.write("**Endelige kategorier:**")
+            st.write(", ".join(final_labels))
+
+            # --- Gruppér centre (gennemsnit) for core_labels og tildel multi-labels igen
             grp_centers = []
-            for g in range(target_n):
+            for g in range(len(core_labels)):
                 members = [i for i in range(best_k) if mapping[i] == g]
                 if members:
                     grp_centers.append(np.mean(centers[members, :], axis=0))
@@ -322,19 +386,30 @@ if uploaded:
             grp_centers = np.vstack(grp_centers)
             grp_centers_norm = normalize(grp_centers, norm="l2", axis=1)
 
-            sims = X_norm @ grp_centers_norm.T  # [n_docs, target_n]
+            sims = X_norm @ grp_centers_norm.T  # [n_docs, len(core_labels)]
 
-            def top3_labels_row(row):
+            # 'Ved ikke' detektor (meget simpel)
+            def is_ved_ikke(text):
+                t = text.strip().lower()
+                return t in {"ved ikke", "ikke ved", "vedikke", "ukendt", "n/a", "na"} or t == ""
+
+            def top3_with_reserved(i_row):
+                row = sims[i_row]
+                if is_ved_ikke(texts[i_row]):
+                    return ["Ved ikke", "", ""], [1.0, np.nan, np.nan]
+
                 idx_sorted = np.argsort(-row)[:3]
-                labs = [merged_labels[i] for i in idx_sorted]
+                labs = [core_labels[i] for i in idx_sorted]
                 scores = [float(row[i]) for i in idx_sorted]
                 out_labs, out_scores = [], []
                 thresholds = [PRIMARY_THRESHOLD, SECOND_THRESHOLD, THIRD_THRESHOLD]
                 for lab, sc, th in zip(labs, scores, thresholds):
                     if sc >= th:
                         out_labs.append(lab); out_scores.append(sc)
+
                 if not out_labs:
                     out_labs = ["Andet"]; out_scores = [0.0]
+
                 while len(out_labs) < 3:
                     out_labs.append(""); out_scores.append(np.nan)
                 return out_labs, out_scores
@@ -342,7 +417,7 @@ if uploaded:
             cats_1, cats_2, cats_3 = [], [], []
             sc_1, sc_2, sc_3 = [], [], []
             for i in range(sims.shape[0]):
-                labs3, scs3 = top3_labels_row(sims[i, :])
+                labs3, scs3 = top3_with_reserved(i)
                 cats_1.append(labs3[0]); cats_2.append(labs3[1]); cats_3.append(labs3[2])
                 sc_1.append(scs3[0]);   sc_2.append(scs3[1]);   sc_3.append(scs3[2])
 
@@ -357,12 +432,11 @@ if uploaded:
             })
 
             # Analyse (efter sammenlægning)
-            categories_info2 = {lab: {"id": i, "top_terms": []} for i, lab in enumerate(merged_labels)}
-            def build_analysis_sheet(df_data, categories_info):
+            def build_analysis_sheet(df_data, labels_final):
                 total = len(df_data)
                 counts = Counter(df_data["Kategori_1"].fillna("Andet"))
                 rows = []
-                for cat, info in categories_info.items():
+                for cat in labels_final:
                     cnt = counts.get(cat, 0)
                     pct = (cnt / total * 100.0) if total else 0.0
                     examples = (
@@ -384,7 +458,7 @@ if uploaded:
                 rows = sorted(rows, key=lambda r: r["Antal"], reverse=True)
                 return pd.DataFrame(rows)
 
-            analysis_df = build_analysis_sheet(df_out, categories_info2)
+            analysis_df = build_analysis_sheet(df_out, final_labels)
 
             st.subheader("Eksempel (efter sammenlægning)")
             st.dataframe(df_out.head(20), use_container_width=True)
@@ -399,7 +473,7 @@ if uploaded:
                     "Dato": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
                     "Antal svar": len(df_out),
                     "Rå-kategorier": best_k,
-                    "Kategorier efter sammenlægning": target_n,
+                    "Kategorier efter sammenlægning (inkl. Andet/Ved ikke)": len(final_labels),
                 }])
                 meta.to_excel(writer, sheet_name="Analyse", index=False, startrow=0)
                 analysis_df.to_excel(writer, sheet_name="Analyse", index=False, startrow=3)
@@ -409,7 +483,7 @@ if uploaded:
                 data=buffer,
                 file_name="aabne_svar_kategoriseret_merged.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                on_click=lambda: log_event("download_after_merge", rows=len(df_out), k_raw=best_k, k_final=target_n)
+                on_click=lambda: log_event("download_after_merge", rows=len(df_out), k_raw=best_k, k_final=len(final_labels))
             )
 
 st.divider()
