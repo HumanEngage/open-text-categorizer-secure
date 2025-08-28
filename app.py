@@ -1,18 +1,20 @@
-# app.py — Streamlit: Ren LLM-baseret analyse af åbne svar (med stram kategorifinding)
-# - Password via Secrets: APP_PASSWORD="din-kode"
-# - Kræver OpenAI: OPENAI_API_KEY="sk-..."
-# - Flow:
-#   1) LLM foreslår entydige kategorier (1–3 ord, uden ord-overlap) — 10–16 stk
-#   2) Du vælger samlet antal (5–20); LLM slår dem sammen til målet
-#   3) LLM klassificerer ALLE svar (op til 3 labels pr. svar, inkl. "Ved ikke"/"Andet")
-#   4) Download Excel
+# app.py — Streamlit: Ren LLM-baseret analyse af åbne svar (med stram kategorifinding + ID-baseret klassifikation)
+# Secrets kræves:
+#   APP_PASSWORD="din-kode"
+#   OPENAI_API_KEY="sk-..."
+#
+# Flow:
+#  1) LLM foreslår entydige kategorier (1–3 ord, uden ord-overlap) — 10–16 stk
+#  2) Brugeren vælger samlet antal (5–20) → LLM slår sammen til målet (uden 'Ved ikke'/'Andet')
+#  3) LLM klassificerer ALLE svar i batches, og returnerer ID'er (1–3 pr. svar)
+#  4) Download Excel
 
 import os
 import io
 import re
 import json
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List
 
 import streamlit as st
 import pandas as pd
@@ -66,7 +68,7 @@ if not check_auth():
 # UI top
 # ---------------------------------------------
 st.title("Åbne besvarelser → Ren LLM-kategorisering")
-st.caption("LLM finder kategorier + klassificerer alle svar (multi-label). Korte, entydige labels uden ord-overlap. ‘Ved ikke’ og ‘Andet’ er altid mulige.")
+st.caption("LLM finder kategorier + klassificerer alle svar (multi-label). Korte, entydige labels uden ord-overlap. 'Ved ikke' og 'Andet' er altid mulige.")
 
 uploaded = st.file_uploader("Upload Excel (.xlsx) – første kolonne skal indeholde de åbne svar", type=["xlsx"])
 
@@ -110,7 +112,6 @@ if st.button("Test LLM-forbindelse"):
 # ---------------------------------------------
 RESERVED = ["Ved ikke", "Andet"]
 
-# Anti-meta og fallback
 FORBIDDEN_LABEL_WORDS = {
     "json","liste","list","kategori","kategorier","kommentar","kommentarer",
     "data","datasæt","dataset","output","returner","returnér","model","openai",
@@ -122,7 +123,6 @@ BASE_FALLBACK_LABELS = [
     "Værdi for pengene","Vilkår og binding","Support svartid","Tilgængelighed",
     "Kvalitet","Fleksibilitet"
 ]
-
 STOPWORDS_DA = {
     "og","i","jeg","det","at","en","den","til","er","som","på","de","med","der",
     "har","for","af","ikke","et","men","vi","kan","om","så","ud","over","sig",
@@ -219,16 +219,12 @@ def openai_client():
     return OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 def llm_propose_categories(texts: List[str], model: str, temperature: float) -> List[str]:
-    """
-    Foreslå 10–16 korte, entydige kategorier (uden 'Ved ikke'/'Andet') fra et udsnit af datasættet.
-    Stram JSON-mode, forbudte ord, hints fra hyppige ord/fraser, og håndhævet min/max.
-    """
+    """Foreslå 10–16 korte, entydige kategorier (uden 'Ved ikke'/'Andet')."""
     client = openai_client()
     sample = sample_texts_for_prompt(texts, max_items=400)
     uni, bi = build_term_hints(sample, max_unigrams=30, max_bigrams=20)
 
     N_MIN, N_MAX = 10, 16
-
     prompt = (
         "Du er en dansktalende analyseassistent. Du får et udsnit af åbne kommentarer.\n"
         f"OPGAVE: Foreslå mellem {N_MIN} og {N_MAX} KORTE, ENTydige kategorier (1–3 ord).\n"
@@ -236,7 +232,6 @@ def llm_propose_categories(texts: List[str], model: str, temperature: float) -> 
         "- INGEN labels må dele samme ord (fx både 'Pris' og 'Høj pris' er ikke ok).\n"
         "- Brug ALDRIG meta-ord som: json, liste, kategorier, data, model, output, svar, tekst.\n"
         "- MEDTAG IKKE 'Ved ikke' eller 'Andet' (de håndteres separat).\n"
-        "- Vælg labels der kan genbruges på tværs af mange typer feedback.\n"
         "- Returnér KUN en JSON med formen: {\"labels\": [\"...\"]}\n\n"
         "Hyppige ord (hint): " + ", ".join(uni[:30]) + "\n"
         "Hyppige fraser (hint): " + ", ".join(bi[:20]) + "\n\n"
@@ -245,7 +240,6 @@ def llm_propose_categories(texts: List[str], model: str, temperature: float) -> 
 
     labels = []
     try:
-        # JSON-mode
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role":"user","content": prompt}],
@@ -257,7 +251,6 @@ def llm_propose_categories(texts: List[str], model: str, temperature: float) -> 
         if isinstance(obj, dict) and isinstance(obj.get("labels"), list):
             labels = [str(x) for x in obj["labels"]]
     except Exception:
-        # fallback uden JSON-mode
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role":"user","content": prompt + "\nReturnér kun JSON som beskrevet."}],
@@ -267,8 +260,6 @@ def llm_propose_categories(texts: List[str], model: str, temperature: float) -> 
         labels = parse_json_lines_list(resp.choices[0].message.content)
 
     labels = dedup_and_enforce_unique_words(labels)
-
-    # Håndhæv MIN/MAX og fyld op fra basislisten, hvis nødvendigt
     if len(labels) < 10:
         for cand in BASE_FALLBACK_LABELS:
             if cand not in labels:
@@ -277,15 +268,11 @@ def llm_propose_categories(texts: List[str], model: str, temperature: float) -> 
                 break
     if len(labels) > 16:
         labels = labels[:16]
-
-    # Endeligt filter mod forbudte ord
     labels = [l for l in labels if all(w.lower() not in FORBIDDEN_LABEL_WORDS for w in l.split())]
     return labels
 
 def llm_merge_categories(labels: List[str], target_core: int, model: str, temperature: float) -> List[str]:
-    """
-    Slå labels sammen til target_core entydige kategorier (uden 'Ved ikke'/'Andet').
-    """
+    """Slå labels sammen til præcis target_core (uden 'Ved ikke'/'Andet')."""
     client = openai_client()
     prompt = (
         "Du får en liste af kategorier. Slå dem sammen til præcis "
@@ -316,8 +303,6 @@ def llm_merge_categories(labels: List[str], target_core: int, model: str, temper
         merged = parse_json_lines_list(resp.choices[0].message.content)
 
     merged = dedup_and_enforce_unique_words(merged)
-
-    # Sikr korrekt antal (pad/trunc)
     if len(merged) < target_core:
         for cand in BASE_FALLBACK_LABELS:
             if cand not in merged:
@@ -328,64 +313,93 @@ def llm_merge_categories(labels: List[str], target_core: int, model: str, temper
         merged = merged[:target_core]
     return merged
 
-def openai_client():
-    from openai import OpenAI
-    if not api_key_present:
-        raise RuntimeError("OPENAI_API_KEY mangler i Secrets.")
-    return OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
+# ---- ID-baseret klassifikation (NY) ----
 def llm_assign_batch(categories: List[str], texts: List[str], model: str) -> List[List[str]]:
     """
-    Klassificér en batch af tekster. Returnér liste af lister (op til 3 labels pr. tekst).
-    Kategorienavne skal vælges fra categories + RESERVED.
+    Klassificér en batch af tekster.
+    Returnér liste af lister (op til 3 labels pr. tekst) — baseret på KATEGORI-ID'er, så vi undgår tekst-mismatch.
     """
     client = openai_client()
-    sys = ("Du er en hjælpsom, deterministisk klassifikations-assistent. Giv kun JSON som svar.")
-    cat_list = categories + RESERVED
+
+    # byg id->label inkl. reserverede
+    cats = [{"id": i + 1, "label": lab} for i, lab in enumerate(categories + RESERVED)]
+    id2label = {c["id"]: c["label"] for c in cats}
+
+    sys = (
+        "Du er en deterministisk klassifikations-assistent. "
+        "Svar KUN med gyldig JSON der kan parses."
+    )
+
     instruct = {
         "task": "Multi-label klassifikation af danske kommentarer",
         "rules": [
-            "Vælg 1–3 labels fra 'categories' for hver kommentar",
-            "Hvis kommentaren udtrykkeligt svarer 'ved ikke'/'ukendt'/tom, brug 'Ved ikke'",
-            "Hvis ingen label passer rimeligt, brug 'Andet'",
-            "Returnér KUN JSON: en liste hvor hver post er en liste med 1–3 kategorier fra 'categories'",
+            "For hver kommentar: vælg 1–3 KATEGORI-ID'er fra 'categories'.",
+            "Hvis kommentaren er tom/‘ved ikke’/uklar → brug ID'et for 'Ved ikke'.",
+            "Hvis ingen kategori passer rimeligt → brug ID'et for 'Andet'.",
+            "Returnér KUN JSON-objekt: {\"preds\": [[id,id],[id], ...]} (samme længde som antal kommentarer)."
         ],
-        "categories": cat_list
+        "categories": cats
     }
+
     joined = "\n".join([f"{i+1}. {t}" for i, t in enumerate(texts)])
-    user = (
+    # mini few-shot for at forankre format
+    ved_ikke_id = next(c['id'] for c in cats if c['label'] == "Ved ikke")
+    user_demo = (
+        json.dumps(instruct, ensure_ascii=False) +
+        "\n\nHer er kommentarerne (nummereret):\n1. Det er for dyrt\n2. Ved ikke\n" +
+        "\nReturnér KUN JSON-objektet beskrevet ovenfor."
+    )
+    assistant_demo = json.dumps({"preds": [[1], [ved_ikke_id]]}, ensure_ascii=False)
+
+    # nu de rigtige data
+    user_real = (
         json.dumps(instruct, ensure_ascii=False) +
         "\n\nHer er kommentarerne (nummereret):\n" + joined +
-        "\n\nReturnér kun JSON-listen: fx [[\"Pris\",\"Hastighed\"],[\"Dækning\"], ...]"
+        "\n\nReturnér KUN JSON-objektet som beskrevet."
     )
+
     resp = client.chat.completions.create(
         model=model,
-        messages=[{"role":"system","content": sys}, {"role":"user","content": user}],
+        messages=[
+            {"role":"system","content": sys},
+            {"role":"user","content": user_demo},
+            {"role":"assistant","content": assistant_demo},
+            {"role":"user","content": user_real},
+        ],
         temperature=0.0,
         max_tokens=4000,
+        response_format={"type": "json_object"},
     )
+
     raw = resp.choices[0].message.content.strip()
     try:
         obj = json.loads(raw)
-        if isinstance(obj, list):
-            out = []
-            for item in obj:
-                if isinstance(item, list):
-                    labs = [str(x) for x in item if str(x).strip()]
-                    labs = [l for l in labs if l in cat_list]
-                    if not labs:
-                        labs = ["Andet"]
-                    out.append(labs[:3])
-                else:
-                    out.append(["Andet"])
-            if len(out) < len(texts):
-                out += [["Andet"]] * (len(texts) - len(out))
-            if len(out) > len(texts):
-                out = out[:len(texts)]
-            return out
     except Exception:
-        pass
-    return [["Andet"] for _ in texts]
+        return [["Andet"] for _ in texts]
+
+    pred_ids = None
+    if isinstance(obj, dict) and isinstance(obj.get("preds"), list):
+        pred_ids = obj["preds"]
+    elif isinstance(obj, list):
+        pred_ids = obj
+
+    if not isinstance(pred_ids, list):
+        return [["Andet"] for _ in texts]
+
+    out = []
+    for item in pred_ids[:len(texts)]:
+        labs = []
+        if isinstance(item, list):
+            for v in item[:3]:
+                if isinstance(v, int) and v in id2label:
+                    labs.append(id2label[v])
+        if not labs:
+            labs = ["Andet"]
+        out.append(labs)
+
+    while len(out) < len(texts):
+        out.append(["Andet"])
+    return out
 
 # ---------------------------------------------
 # Hovedflow
