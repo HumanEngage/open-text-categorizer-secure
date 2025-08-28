@@ -31,13 +31,15 @@ st.set_page_config(page_title="Åbne svar → Entydige kategorier (secure)", lay
 # -------------------------------------------------
 MIN_DF = 5
 MAX_FEATURES = 40000
-NGRAM_RANGE = (1, 2)
-K_RANGE = range(6, 16)       # lidt færre rå-klynger for mere robuste emner
+NGRAM_RANGE = (1, 3)        # NU: også trigrammer (bedre fraser som "fri data")
+K_RANGE = range(6, 16)      # lidt færre rå-klynger for mere robuste emner
 TOP_TERMS_PER_CAT = 8
 TOP_QUOTES_PER_CAT = 3
+
+# Absolutte tærskler bruges stadig som bund – men vi vælger relativt i tildeling
 PRIMARY_THRESHOLD = 0.18
-SECOND_THRESHOLD  = 0.14
-THIRD_THRESHOLD   = 0.12
+SECOND_THRESHOLD  = 0.12
+THIRD_THRESHOLD   = 0.10
 
 # Stopord (dansk + engelsk)
 DANISH_SW = {
@@ -99,7 +101,7 @@ st.title("Åbne besvarelser → Entydige kategorier")
 st.caption("Auto-emner → LLM rydder op (1–3 ord, uden ord-overlap) → vælg mål-antal (5–20) → sammenlæg (bevar 'Ved ikke' og 'Andet') → multi-label → download.")
 st.markdown(
     "Upload et Excel-ark med en kolonne med åbne svar (fx **Svar**). "
-    "App'en finder rå-emner; LLM kan gøre labels entydige (1–3 ord, uden ord-overlap); "
+    "App'en finder rå-emner; LLM kan give entydige labels (1–3 ord, uden ord-overlap); "
     "du kan slå dem sammen til et ønsket antal kategorier."
 )
 
@@ -153,6 +155,25 @@ def normalize_label(label: str) -> str:
     if not words:
         return "Andet"
     return " ".join(words).capitalize()
+
+# --- Tekst-normalisering til tildeling (ord i teksten = hint) ---
+def norm_token(w: str) -> str:
+    w = w.lower()
+    w = re.sub(r"[^a-zA-ZæøåÆØÅ]", "", w)
+    for suf in ["erne","enes","ende","tene","eren","er","en","et","e"]:
+        if w.endswith(suf) and len(w) > len(suf) + 1:
+            w = w[:-len(suf)]
+            break
+    return w
+
+def tokens_from_text(s: str):
+    raw = re.findall(r"[A-Za-zÆØÅæøå]+", s.lower())
+    return [norm_token(w) for w in raw if len(norm_token(w)) >= 2]
+
+def contains_category_word(text: str, category_label: str) -> bool:
+    tset = set(tokens_from_text(text))
+    lab_toks = [norm_token(w) for w in re.findall(r"[A-Za-zÆØÅæøå]+", category_label)]
+    return any(tok in tset for tok in lab_toks if tok)
 
 # --- LLM navngivning globalt (1–3 ord, og ingen ord-overlap på tværs) ---
 def _label_tokens(s: str):
@@ -241,7 +262,7 @@ def merge_category_centers(centers, id2label, counts, target_n):
     D = cosine_distances(centers)
     agg = AgglomerativeClustering(
         n_clusters=target_n,
-        metric="precomputed",   # vigitgt i ny sklearn
+        metric="precomputed",   # vigtigt i ny sklearn
         linkage="average",
     )
     groups = agg.fit_predict(D)
@@ -393,26 +414,46 @@ if uploaded:
                 t = text.strip().lower()
                 return t in {"ved ikke", "ikke ved", "vedikke", "ukendt", "n/a", "na"} or t == ""
 
+            # --- Bedre multi-label tildeling: relativ cut + "ord i teksten"-hint
             def top3_with_reserved(i_row):
                 row = sims[i_row]
+
+                # 1) eksplicit "Ved ikke"
                 if is_ved_ikke(texts[i_row]):
                     return ["Ved ikke", "", ""], [1.0, np.nan, np.nan]
 
-                idx_sorted = np.argsort(-row)[:3]
-                labs = [core_labels[i] for i in idx_sorted]
-                scores = [float(row[i]) for i in idx_sorted]
-                out_labs, out_scores = [], []
-                thresholds = [PRIMARY_THRESHOLD, SECOND_THRESHOLD, THIRD_THRESHOLD]
-                for lab, sc, th in zip(labs, scores, thresholds):
-                    if sc >= th:
-                        out_labs.append(lab); out_scores.append(sc)
+                # 2) relativ tærskel omkring bedste score + absolut bundgrænse
+                idx_sorted = np.argsort(-row)
+                best = float(row[idx_sorted[0]]) if idx_sorted.size else 0.0
+                rel_cut = 0.88  # tag alt, der ligger inden for 88% af tophøjden
+                abs_cut = 0.12  # men kræv også mindst denne absolutte værdi
 
-                if not out_labs:
-                    out_labs = ["Andet"]; out_scores = [0.0]
+                chosen = []
+                for j in idx_sorted[:5]:
+                    sc = float(row[j])
+                    if sc >= abs_cut and (best == 0 or sc >= best * rel_cut):
+                        chosen.append((j, sc))
+                    if len(chosen) >= 3:
+                        break
 
-                while len(out_labs) < 3:
-                    out_labs.append(""); out_scores.append(np.nan)
-                return out_labs, out_scores
+                # 3) ord i teksten = stærkt hint (force-inkludér op til 3 i alt)
+                text_i = texts[i_row]
+                for j in idx_sorted[:5]:
+                    lab = core_labels[j]
+                    sc = float(row[j])
+                    if contains_category_word(text_i, lab) and (j, sc) not in chosen:
+                        chosen.append((j, sc))
+                    if len(chosen) >= 3:
+                        break
+
+                if not chosen:
+                    return ["Andet", "", ""], [0.0, np.nan, np.nan]
+
+                labs = [core_labels[j] for j, _ in chosen[:3]]
+                scs  = [float(s) for _, s in chosen[:3]]
+                while len(labs) < 3:
+                    labs.append(""); scs.append(np.nan)
+                return labs, scs
 
             cats_1, cats_2, cats_3 = [], [], []
             sc_1, sc_2, sc_3 = [], [], []
@@ -457,6 +498,12 @@ if uploaded:
                     })
                 rows = sorted(rows, key=lambda r: r["Antal"], reverse=True)
                 return pd.DataFrame(rows)
+
+            final_labels = list(core_labels)
+            if not any(lbl.lower() == "ved ikke" for lbl in final_labels):
+                final_labels.append("Ved ikke")
+            if not any(lbl.lower() == "andet" for lbl in final_labels):
+                final_labels.append("Andet")
 
             analysis_df = build_analysis_sheet(df_out, final_labels)
 
